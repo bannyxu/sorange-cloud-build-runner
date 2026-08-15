@@ -208,8 +208,11 @@ jobs:
         run: |
           set -euo pipefail
           certificate_path="$RUNNER_TEMP/sorange-windows-signing.pfx"
-          if [[ -n "${WINDOWS_CODE_SIGNING_PFX_BASE64:-}" && -n "${WINDOWS_CODE_SIGNING_PFX_PASSWORD:-}" ]]; then
-            python3 - "$certificate_path" <<'PY'
+          if [[ -z "${WINDOWS_CODE_SIGNING_PFX_BASE64:-}" || -z "${WINDOWS_CODE_SIGNING_PFX_PASSWORD:-}" ]]; then
+            echo '::error::Windows release blocked: WINDOWS_CODE_SIGNING_PFX_BASE64 and WINDOWS_CODE_SIGNING_PFX_PASSWORD are required.' >&2
+            exit 1
+          fi
+          python3 - "$certificate_path" <<'PY'
           import base64
           import os
           import pathlib
@@ -217,12 +220,8 @@ jobs:
 
           pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(os.environ["WINDOWS_CODE_SIGNING_PFX_BASE64"]))
           PY
-            export WIN_CSC_LINK="$certificate_path"
-            export WIN_CSC_KEY_PASSWORD="$WINDOWS_CODE_SIGNING_PFX_PASSWORD"
-          else
-            echo 'Windows signing secrets are not configured. Building a functionally verified unsigned installer.' >&2
-            unset WIN_CSC_LINK WIN_CSC_KEY_PASSWORD || true
-          fi
+          export WIN_CSC_LINK="$certificate_path"
+          export WIN_CSC_KEY_PASSWORD="$WINDOWS_CODE_SIGNING_PFX_PASSWORD"
 
           pnpm --filter @sorange-v2/desktop build
           export SORANGE_WINDOWS_SKIP_ZIP=1
@@ -309,45 +308,27 @@ jobs:
       - name: Install and smoke test Windows package
         shell: pwsh
         working-directory: source
-        env:
-          WINDOWS_CODE_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_CODE_SIGNING_PFX_BASE64 }}
-          WINDOWS_CODE_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_CODE_SIGNING_PFX_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
           $installer = Get-ChildItem 'apps/desktop/release-builder/SOrange-*-win-x64.exe' |
             Sort-Object LastWriteTime -Descending |
             Select-Object -First 1
           if (-not $installer -or $installer.Length -le 0) { throw 'Windows installer was not downloaded' }
-
-          $hasSigningCertificate = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CODE_SIGNING_PFX_BASE64) -and
-            -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CODE_SIGNING_PFX_PASSWORD)
-          $installDir = Join-Path $env:RUNNER_TEMP 'SOrange-installed'
-          if (Test-Path $installDir) { Remove-Item -LiteralPath $installDir -Recurse -Force }
-          $installProcess = Start-Process -FilePath $installer.FullName -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
-          if ($installProcess.ExitCode -ne 0) { throw "Silent installer failed with exit code $($installProcess.ExitCode)" }
-
-          $installedExecutable = Join-Path $installDir 'SOrange.exe'
-          if (-not (Test-Path $installedExecutable)) { throw "Installed SOrange.exe was not found at $installedExecutable" }
-          node apps/desktop/scripts/verify-windows-package.mjs --app-dir $installDir --version $env:SORANGE_DESKTOP_VERSION
-          if ($LASTEXITCODE -ne 0) { throw "Installed package verification failed with exit code $LASTEXITCODE" }
-          if ($hasSigningCertificate) {
-            & 'apps/desktop/scripts/verify-windows-authenticode.ps1' -FilePath @($installedExecutable, $installer.FullName)
-          }
-
-          $env:SORANGE_DESKTOP_PACKAGED_EXECUTABLE = $installedExecutable
-          $env:SORANGE_DESKTOP_USER_DATA_DIR = Join-Path $env:RUNNER_TEMP 'sorange-smoke-user-data'
-          $env:SORANGE_DESKTOP_SMOKE_SCREENSHOT = Join-Path $env:RUNNER_TEMP 'sorange-smoke.png'
-          $env:SORANGE_DESKTOP_SMOKE_TIMEOUT_MS = '120000'
-          node apps/desktop/scripts/smoke-packaged.mjs
-          if ($LASTEXITCODE -ne 0) { throw "Installed app smoke failed with exit code $LASTEXITCODE" }
-          if (-not (Test-Path $env:SORANGE_DESKTOP_SMOKE_SCREENSHOT)) { throw 'Installed app smoke screenshot was not created' }
-
-          $signatureStatus = if ($hasSigningCertificate) { 'valid' } else { 'unsigned' }
+          & 'apps/desktop/scripts/test-windows-installer.ps1' -InstallerPath $installer.FullName -Version $env:SORANGE_DESKTOP_VERSION -Cycles 2 -RequireSignature
           @(
             'RELEASE_ARTIFACT_VERIFICATION_STATUS=verified'
-            "RELEASE_ARTIFACT_SIGNATURE_STATUS=$signatureStatus"
+            'RELEASE_ARTIFACT_SIGNATURE_STATUS=valid'
             'RELEASE_ARTIFACT_SMOKE_STATUS=passed'
           ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Preserve Windows smoke screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sorange-${{ inputs.version }}-win-x64-smoke
+          path: ${{ runner.temp }}/sorange-smoke-*.png
+          if-no-files-found: warn
+          retention-days: 3
 
       - name: Upload verified Windows installer to the website server
         run: |

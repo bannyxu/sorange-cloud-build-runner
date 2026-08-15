@@ -1,0 +1,141 @@
+name: SOrange Windows Installer E2E
+
+"on":
+  workflow_dispatch:
+    inputs:
+      source_revision:
+        description: Exact Burns1028/sorange branch, tag, or commit to test
+        required: true
+      version:
+        description: Test package version
+        required: true
+        default: 2.0.17-test.1
+      cycles:
+        description: Install/upgrade/uninstall cycles per Windows runner
+        required: true
+        type: choice
+        default: "2"
+        options:
+          - "1"
+          - "2"
+          - "3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sorange-windows-installer-e2e-${{ inputs.source_revision }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build unsigned validation installer
+    runs-on: macos-15-intel
+    timeout-minutes: 180
+    env:
+      SORANGE_DESKTOP_VERSION: ${{ inputs.version }}
+      SORANGE_DESKTOP_TARGET_ARCH: x64
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - name: Check out app source
+        uses: actions/checkout@v5
+        with:
+          repository: Burns1028/sorange
+          ref: ${{ inputs.source_revision }}
+          token: ${{ secrets.SOURCE_REPOSITORY_TOKEN }}
+          path: source
+          fetch-depth: 1
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.8.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile
+
+      - name: Apply test version
+        working-directory: source
+        run: node scripts/set-desktop-release-version.mjs "${{ inputs.version }}"
+
+      - name: Build unsigned installer for functional validation only
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm --filter @sorange-v2/desktop build
+          export SORANGE_WINDOWS_SKIP_ZIP=1
+          node apps/desktop/scripts/package-windows.mjs
+          portable_app="$PWD/apps/desktop/release/SOrange-win32-x64"
+          pnpm --filter @sorange-v2/desktop exec electron-builder \
+            --projectDir . \
+            --config electron-builder.yml \
+            --prepackaged "$portable_app" \
+            --win nsis \
+            --x64 \
+            --publish never
+
+      - name: Upload validation installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: sorange-windows-installer-e2e
+          path: source/apps/desktop/release-builder/SOrange-*-win-x64.exe
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+  validate:
+    name: ${{ matrix.os }} default install and upgrade
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-2022
+          - windows-2025
+    steps:
+      - name: Check out app source
+        uses: actions/checkout@v5
+        with:
+          repository: Burns1028/sorange
+          ref: ${{ inputs.source_revision }}
+          token: ${{ secrets.SOURCE_REPOSITORY_TOKEN }}
+          path: source
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Download validation installer
+        uses: actions/download-artifact@v5
+        with:
+          name: sorange-windows-installer-e2e
+          path: source/apps/desktop/release-builder
+
+      - name: Test default install, running upgrade, smoke, and uninstall
+        shell: pwsh
+        working-directory: source
+        run: |
+          $installer = Get-ChildItem 'apps/desktop/release-builder/SOrange-*-win-x64.exe' |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $installer) { throw 'Windows installer was not downloaded' }
+          & 'apps/desktop/scripts/test-windows-installer.ps1' -InstallerPath $installer.FullName -Version '${{ inputs.version }}' -Cycles ${{ inputs.cycles }}
+
+      - name: Upload smoke screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sorange-windows-installer-e2e-${{ matrix.os }}-smoke
+          path: ${{ runner.temp }}/sorange-smoke-*.png
+          if-no-files-found: warn
+          retention-days: 2
