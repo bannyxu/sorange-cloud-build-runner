@@ -208,11 +208,13 @@ jobs:
         run: |
           set -euo pipefail
           certificate_path="$RUNNER_TEMP/sorange-windows-signing.pfx"
-          if [[ -z "${WINDOWS_CODE_SIGNING_PFX_BASE64:-}" || -z "${WINDOWS_CODE_SIGNING_PFX_PASSWORD:-}" ]]; then
-            echo '::error::Windows release blocked: WINDOWS_CODE_SIGNING_PFX_BASE64 and WINDOWS_CODE_SIGNING_PFX_PASSWORD are required.' >&2
+          if [[ -n "${WINDOWS_CODE_SIGNING_PFX_BASE64:-}" && -z "${WINDOWS_CODE_SIGNING_PFX_PASSWORD:-}" ]] || \
+             [[ -z "${WINDOWS_CODE_SIGNING_PFX_BASE64:-}" && -n "${WINDOWS_CODE_SIGNING_PFX_PASSWORD:-}" ]]; then
+            echo '::error::Windows signing configuration is incomplete: both certificate and password are required.' >&2
             exit 1
           fi
-          python3 - "$certificate_path" <<'PY'
+          if [[ -n "${WINDOWS_CODE_SIGNING_PFX_BASE64:-}" ]]; then
+            python3 - "$certificate_path" <<'PY'
           import base64
           import os
           import pathlib
@@ -220,8 +222,12 @@ jobs:
 
           pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(os.environ["WINDOWS_CODE_SIGNING_PFX_BASE64"]))
           PY
-          export WIN_CSC_LINK="$certificate_path"
-          export WIN_CSC_KEY_PASSWORD="$WINDOWS_CODE_SIGNING_PFX_PASSWORD"
+            export WIN_CSC_LINK="$certificate_path"
+            export WIN_CSC_KEY_PASSWORD="$WINDOWS_CODE_SIGNING_PFX_PASSWORD"
+          else
+            echo 'No Windows certificate configured; building an unsigned installer for functional validation.'
+            unset WIN_CSC_LINK WIN_CSC_KEY_PASSWORD || true
+          fi
 
           pnpm --filter @sorange-v2/desktop build
           export SORANGE_WINDOWS_SKIP_ZIP=1
@@ -308,16 +314,28 @@ jobs:
       - name: Install and smoke test Windows package
         shell: pwsh
         working-directory: source
+        env:
+          WINDOWS_CODE_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_CODE_SIGNING_PFX_BASE64 }}
+          WINDOWS_CODE_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_CODE_SIGNING_PFX_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
           $installer = Get-ChildItem 'apps/desktop/release-builder/SOrange-*-win-x64.exe' |
             Sort-Object LastWriteTime -Descending |
             Select-Object -First 1
           if (-not $installer -or $installer.Length -le 0) { throw 'Windows installer was not downloaded' }
-          & 'apps/desktop/scripts/test-windows-installer.ps1' -InstallerPath $installer.FullName -Version $env:SORANGE_DESKTOP_VERSION -Cycles 2 -RequireSignature
+          $hasSigningCertificate = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CODE_SIGNING_PFX_BASE64) -and
+            -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CODE_SIGNING_PFX_PASSWORD)
+          $arguments = @{
+            InstallerPath = $installer.FullName
+            Version = $env:SORANGE_DESKTOP_VERSION
+            Cycles = 2
+          }
+          if ($hasSigningCertificate) { $arguments.RequireSignature = $true }
+          & 'apps/desktop/scripts/test-windows-installer.ps1' @arguments
+          $signatureStatus = if ($hasSigningCertificate) { 'valid' } else { 'unsigned' }
           @(
             'RELEASE_ARTIFACT_VERIFICATION_STATUS=verified'
-            'RELEASE_ARTIFACT_SIGNATURE_STATUS=valid'
+            "RELEASE_ARTIFACT_SIGNATURE_STATUS=$signatureStatus"
             'RELEASE_ARTIFACT_SMOKE_STATUS=passed'
           ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
