@@ -19,6 +19,10 @@ name: SOrange Windows Installer E2E
           - "1"
           - "2"
           - "3"
+      previous_installer_url:
+        description: Optional previous SOrange installer URL for a cross-version upgrade test
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -121,6 +125,18 @@ jobs:
           name: sorange-windows-installer-e2e
           path: source/apps/desktop/release-builder
 
+      - name: Download previous installer for cross-version upgrade
+        if: inputs.previous_installer_url != ''
+        shell: pwsh
+        working-directory: source
+        run: |
+          $destination = Join-Path $env:RUNNER_TEMP 'SOrange-previous-win-x64.exe'
+          Invoke-WebRequest -Uri '${{ inputs.previous_installer_url }}' -OutFile $destination -MaximumRetryCount 3 -RetryIntervalSec 5
+          if (-not (Test-Path -LiteralPath $destination) -or (Get-Item -LiteralPath $destination).Length -le 0) {
+            throw 'Previous Windows installer was not downloaded'
+          }
+          "SORANGE_PREVIOUS_INSTALLER=$destination" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Test default install, running upgrade, smoke, and uninstall
         shell: pwsh
         working-directory: source
@@ -129,13 +145,32 @@ jobs:
             Sort-Object LastWriteTime -Descending |
             Select-Object -First 1
           if (-not $installer) { throw 'Windows installer was not downloaded' }
-          & 'apps/desktop/scripts/test-windows-installer.ps1' -InstallerPath $installer.FullName -Version '${{ inputs.version }}' -Cycles ${{ inputs.cycles }}
+          $arguments = @{
+            InstallerPath = $installer.FullName
+            Version = '${{ inputs.version }}'
+            Cycles = ${{ inputs.cycles }}
+          }
+          if (-not [string]::IsNullOrWhiteSpace($env:SORANGE_PREVIOUS_INSTALLER)) {
+            $arguments.PreviousInstallerPath = $env:SORANGE_PREVIOUS_INSTALLER
+          }
+          & 'apps/desktop/scripts/test-windows-installer.ps1' @arguments
+
+      - name: Stage installer trace
+        if: always()
+        shell: pwsh
+        run: |
+          $trace = Join-Path $env:TEMP 'sorange-installer-trace.log'
+          if (Test-Path -LiteralPath $trace) {
+            Copy-Item -LiteralPath $trace -Destination (Join-Path $env:RUNNER_TEMP 'sorange-installer-trace.log') -Force
+          }
 
       - name: Upload smoke screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sorange-windows-installer-e2e-${{ matrix.os }}-smoke
-          path: ${{ runner.temp }}/sorange-smoke-*.png
+          path: |
+            ${{ runner.temp }}/sorange-smoke-*.png
+            ${{ runner.temp }}/sorange-installer-trace.log
           if-no-files-found: warn
           retention-days: 2
