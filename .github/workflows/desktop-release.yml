@@ -109,10 +109,10 @@ jobs:
               matrix='{"include":[{"target":"mac-x64","os":"macos-15-intel","kind":"mac","arch":"x64","puppeteer_platform":"mac","artifact_glob":"apps/desktop/release/SOrange-*-mac-x64.dmg"}]}'
               ;;
             win-x64)
-              matrix='{"include":[{"target":"win-x64","os":"windows-latest","kind":"windows","arch":"x64","artifact_glob":"apps/desktop/release-builder/SOrange-*-win-x64.exe"}]}'
+              matrix='{"include":[{"target":"win-x64","os":"macos-15-intel","kind":"windows-package","arch":"x64","artifact_glob":"apps/desktop/release-builder/SOrange-*-win-x64.exe"}]}'
               ;;
             all|"")
-              matrix='{"include":[{"target":"mac-arm64","os":"macos-26","kind":"mac","arch":"arm64","puppeteer_platform":"mac_arm","artifact_glob":"apps/desktop/release/SOrange-*-mac-arm64.dmg"},{"target":"mac-x64","os":"macos-15-intel","kind":"mac","arch":"x64","puppeteer_platform":"mac","artifact_glob":"apps/desktop/release/SOrange-*-mac-x64.dmg"},{"target":"win-x64","os":"windows-latest","kind":"windows","arch":"x64","artifact_glob":"apps/desktop/release-builder/SOrange-*-win-x64.exe"}]}'
+              matrix='{"include":[{"target":"mac-arm64","os":"macos-26","kind":"mac","arch":"arm64","puppeteer_platform":"mac_arm","artifact_glob":"apps/desktop/release/SOrange-*-mac-arm64.dmg"},{"target":"mac-x64","os":"macos-15-intel","kind":"mac","arch":"x64","puppeteer_platform":"mac","artifact_glob":"apps/desktop/release/SOrange-*-mac-x64.dmg"},{"target":"win-x64","os":"macos-15-intel","kind":"windows-package","arch":"x64","artifact_glob":"apps/desktop/release-builder/SOrange-*-win-x64.exe"}]}'
               ;;
             *)
               echo "Unsupported target filter: $TARGET_FILTER" >&2
@@ -199,7 +199,114 @@ jobs:
         run: node apps/desktop/scripts/local-github-macos-fallback.mjs --package 2>&1 | tee "$RUNNER_TEMP/sorange-package.log"
 
       - name: Build and verify Windows installer
-        if: matrix.kind == 'windows'
+        if: matrix.kind == 'windows-package'
+        shell: bash
+        working-directory: source
+        env:
+          WINDOWS_CODE_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_CODE_SIGNING_PFX_BASE64 }}
+          WINDOWS_CODE_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_CODE_SIGNING_PFX_PASSWORD }}
+        run: |
+          set -euo pipefail
+          certificate_path="$RUNNER_TEMP/sorange-windows-signing.pfx"
+          if [[ -n "${WINDOWS_CODE_SIGNING_PFX_BASE64:-}" && -n "${WINDOWS_CODE_SIGNING_PFX_PASSWORD:-}" ]]; then
+            python3 - "$certificate_path" <<'PY'
+          import base64
+          import os
+          import pathlib
+          import sys
+
+          pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(os.environ["WINDOWS_CODE_SIGNING_PFX_BASE64"]))
+          PY
+            export WIN_CSC_LINK="$certificate_path"
+            export WIN_CSC_KEY_PASSWORD="$WINDOWS_CODE_SIGNING_PFX_PASSWORD"
+          else
+            echo 'Windows signing secrets are not configured. Building a functionally verified unsigned installer.' >&2
+            unset WIN_CSC_LINK WIN_CSC_KEY_PASSWORD || true
+          fi
+
+          pnpm --filter @sorange-v2/desktop build
+          export SORANGE_WINDOWS_SKIP_ZIP=1
+          node apps/desktop/scripts/package-windows.mjs
+          portable_app="$PWD/apps/desktop/release/SOrange-win32-x64"
+          pnpm --filter @sorange-v2/desktop exec electron-builder \
+            --projectDir . \
+            --config electron-builder.yml \
+            --prepackaged "$portable_app" \
+            --win nsis \
+            --x64 \
+            --publish never
+          installer="$(find apps/desktop/release-builder -maxdepth 1 -type f -name 'SOrange-*-win-x64.exe' -print -quit)"
+          [[ -n "$installer" && -s "$installer" ]] || { echo 'Windows installer was not created' >&2; exit 1; }
+          node apps/desktop/scripts/verify-windows-package.mjs --app-dir "$portable_app" --version "$SORANGE_DESKTOP_VERSION"
+          rm -f "$certificate_path"
+
+      - name: Preserve packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sorange-${{ inputs.version }}-${{ matrix.target }}
+          path: source/${{ matrix.artifact_glob }}
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload to the website server and synchronize status
+        if: matrix.kind != 'windows-package'
+        run: |
+          python -m pip install --quiet requests
+          python release-control/scripts/upload_desktop_release_artifact.py --status uploaded --target "${{ matrix.target }}" --artifact-glob "source/${{ matrix.artifact_glob }}"
+
+      - name: Report target failure
+        if: failure()
+        run: python release-control/scripts/upload_desktop_release_artifact.py --status failed --target "${{ matrix.target }}" --error "${{ matrix.target }} cloud build failed"
+
+  validate-windows:
+    name: Install and smoke test win-x64
+    needs:
+      - prepare
+      - build
+    if: ${{ always() && needs.prepare.result == 'success' && (inputs.target_filter == 'win-x64' || inputs.target_filter == 'all') }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      SORANGE_DESKTOP_VERSION: ${{ inputs.version }}
+      RELEASE_ID: ${{ inputs.release_id }}
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_CHANNEL: ${{ inputs.channel }}
+      RELEASE_CALLBACK_URL: ${{ inputs.callback_url }}
+      RELEASE_CALLBACK_TOKEN: ${{ secrets.RELEASE_CALLBACK_TOKEN }}
+      BUILD_RUN_ID: github:${{ github.run_id }}
+    steps:
+      - name: Check out release control
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: release-control
+
+      - name: Check out locked app source
+        uses: actions/checkout@v5
+        with:
+          repository: Burns1028/sorange
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          token: ${{ secrets.SOURCE_REPOSITORY_TOKEN }}
+          path: source
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Download Windows installer
+        uses: actions/download-artifact@v5
+        with:
+          name: sorange-${{ inputs.version }}-win-x64
+          path: source/apps/desktop/release-builder
+
+      - name: Install and smoke test Windows package
         shell: pwsh
         working-directory: source
         env:
@@ -207,57 +314,13 @@ jobs:
           WINDOWS_CODE_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_CODE_SIGNING_PFX_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $hasSigningCertificate = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CODE_SIGNING_PFX_BASE64) -and
-            -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CODE_SIGNING_PFX_PASSWORD)
-          $certificatePath = Join-Path $env:RUNNER_TEMP 'sorange-windows-signing.pfx'
-          if ($hasSigningCertificate) {
-            [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_CODE_SIGNING_PFX_BASE64))
-            $env:WIN_CSC_LINK = $certificatePath
-            $env:WIN_CSC_KEY_PASSWORD = $env:WINDOWS_CODE_SIGNING_PFX_PASSWORD
-          } else {
-            Write-Warning 'Windows signing secrets are not configured. Building a functionally verified unsigned installer.'
-            Remove-Item Env:WIN_CSC_LINK -ErrorAction SilentlyContinue
-            Remove-Item Env:WIN_CSC_KEY_PASSWORD -ErrorAction SilentlyContinue
-          }
-
-          pnpm --filter @sorange-v2/desktop build
-          if ($LASTEXITCODE -ne 0) { throw "Desktop build failed with exit code $LASTEXITCODE" }
-
-          $env:SORANGE_WINDOWS_SKIP_ZIP = '1'
-          node apps/desktop/scripts/package-windows.mjs
-          if ($LASTEXITCODE -ne 0) { throw "Complete Windows app packaging failed with exit code $LASTEXITCODE" }
-
-          $portableApp = Resolve-Path 'apps/desktop/release/SOrange-win32-x64'
-          $portableExecutable = Join-Path $portableApp 'SOrange.exe'
-          if ($hasSigningCertificate) {
-            $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
-              Sort-Object FullName -Descending |
-              Select-Object -First 1
-            if (-not $signTool) { throw 'signtool.exe was not found on the Windows runner' }
-            & $signTool.FullName sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f $certificatePath /p $env:WINDOWS_CODE_SIGNING_PFX_PASSWORD $portableExecutable
-            if ($LASTEXITCODE -ne 0) { throw "SOrange.exe signing failed with exit code $LASTEXITCODE" }
-          }
-
-          pnpm --filter @sorange-v2/desktop exec electron-builder `
-            --projectDir . `
-            --config electron-builder.yml `
-            --prepackaged $portableApp `
-            --win nsis `
-            --x64 `
-            --publish never
-          if ($LASTEXITCODE -ne 0) { throw "Windows installer packaging failed with exit code $LASTEXITCODE" }
-
           $installer = Get-ChildItem 'apps/desktop/release-builder/SOrange-*-win-x64.exe' |
             Sort-Object LastWriteTime -Descending |
             Select-Object -First 1
-          if (-not $installer -or $installer.Length -le 0) { throw 'Windows installer was not created' }
+          if (-not $installer -or $installer.Length -le 0) { throw 'Windows installer was not downloaded' }
 
-          node apps/desktop/scripts/verify-windows-package.mjs --app-dir $portableApp --version $env:SORANGE_DESKTOP_VERSION
-          if ($LASTEXITCODE -ne 0) { throw "Windows package structure verification failed with exit code $LASTEXITCODE" }
-          if ($hasSigningCertificate) {
-            & 'apps/desktop/scripts/verify-windows-authenticode.ps1' -FilePath @($portableExecutable, $installer.FullName)
-          }
-
+          $hasSigningCertificate = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CODE_SIGNING_PFX_BASE64) -and
+            -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CODE_SIGNING_PFX_PASSWORD)
           $installDir = Join-Path $env:RUNNER_TEMP 'SOrange-installed'
           if (Test-Path $installDir) { Remove-Item -LiteralPath $installDir -Recurse -Force }
           $installProcess = Start-Process -FilePath $installer.FullName -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
@@ -275,7 +338,7 @@ jobs:
           $env:SORANGE_DESKTOP_USER_DATA_DIR = Join-Path $env:RUNNER_TEMP 'sorange-smoke-user-data'
           $env:SORANGE_DESKTOP_SMOKE_SCREENSHOT = Join-Path $env:RUNNER_TEMP 'sorange-smoke.png'
           $env:SORANGE_DESKTOP_SMOKE_TIMEOUT_MS = '120000'
-          pnpm --filter @sorange-v2/desktop smoke:packaged
+          node apps/desktop/scripts/smoke-packaged.mjs
           if ($LASTEXITCODE -ne 0) { throw "Installed app smoke failed with exit code $LASTEXITCODE" }
           if (-not (Test-Path $env:SORANGE_DESKTOP_SMOKE_SCREENSHOT)) { throw 'Installed app smoke screenshot was not created' }
 
@@ -286,22 +349,11 @@ jobs:
             'RELEASE_ARTIFACT_SMOKE_STATUS=passed'
           ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          if (Test-Path $certificatePath) { Remove-Item -LiteralPath $certificatePath -Force }
-
-      - name: Preserve packaged artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: sorange-${{ inputs.version }}-${{ matrix.target }}
-          path: source/${{ matrix.artifact_glob }}
-          if-no-files-found: error
-          retention-days: 3
-          compression-level: 0
-
-      - name: Upload to the website server and synchronize status
+      - name: Upload verified Windows installer to the website server
         run: |
           python -m pip install --quiet requests
-          python release-control/scripts/upload_desktop_release_artifact.py --status uploaded --target "${{ matrix.target }}" --artifact-glob "source/${{ matrix.artifact_glob }}"
+          python release-control/scripts/upload_desktop_release_artifact.py --status uploaded --target win-x64 --artifact-glob "source/apps/desktop/release-builder/SOrange-*-win-x64.exe"
 
-      - name: Report target failure
+      - name: Report Windows validation failure
         if: failure()
-        run: python release-control/scripts/upload_desktop_release_artifact.py --status failed --target "${{ matrix.target }}" --error "${{ matrix.target }} cloud build failed"
+        run: python release-control/scripts/upload_desktop_release_artifact.py --status failed --target win-x64 --error "win-x64 install or smoke validation failed"
