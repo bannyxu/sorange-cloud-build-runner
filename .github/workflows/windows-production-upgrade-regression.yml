@@ -1,0 +1,168 @@
+name: Windows Production Upgrade Regression
+
+"on":
+  workflow_dispatch:
+    inputs:
+      baseline_version:
+        description: Installed version used as the upgrade baseline
+        required: true
+        default: 2.0.18
+      baseline_source_revision:
+        description: Exact SOrange source commit used to rebuild the baseline installer
+        required: true
+        default: 9d1a1a6df67c0c3a5a4bb0e617552470cf3f124a
+      target_version:
+        description: Published version under validation
+        required: true
+        default: 2.0.20
+      target_installer_url:
+        description: Immutable production Windows installer URL
+        required: true
+        default: https://sorange.cn/desktop-releases/stable/2.0.20--r39/win-x64/1bc76e7a1231a16d/SOrange-2.0.20-win-x64.exe
+      target_sha256:
+        description: Expected SHA256 for the production installer
+        required: true
+        default: 1bc76e7a1231a16d399feb932e4eb0b0e79f32d6e482aa588add3eb8f1edbb58
+      validation_source_revision:
+        description: SOrange source revision containing the validation harness
+        required: true
+        default: 8d2528fb036ad436ae115e1971fcbe7fa671f864
+
+permissions:
+  contents: read
+
+jobs:
+  build-baseline:
+    name: Build Windows ${{ inputs.baseline_version }} baseline
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    env:
+      SORANGE_DESKTOP_VERSION: ${{ inputs.baseline_version }}
+      SORANGE_DESKTOP_TARGET_ARCH: x64
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - name: Check out baseline source
+        uses: actions/checkout@v5
+        with:
+          repository: Burns1028/sorange
+          ref: ${{ inputs.baseline_source_revision }}
+          token: ${{ secrets.SOURCE_REPOSITORY_TOKEN }}
+          path: source
+          fetch-depth: 1
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.8.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile
+
+      - name: Apply baseline release version
+        working-directory: source
+        run: node scripts/set-desktop-release-version.mjs "${{ inputs.baseline_version }}"
+
+      - name: Build baseline Windows installer
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm --filter @sorange-v2/desktop build
+          export SORANGE_WINDOWS_SKIP_ZIP=1
+          node apps/desktop/scripts/package-windows.mjs
+          portable_app="$PWD/apps/desktop/release/SOrange-win32-x64"
+          pnpm --filter @sorange-v2/desktop exec electron-builder \
+            --projectDir . \
+            --config electron-builder.yml \
+            --prepackaged "$portable_app" \
+            --win nsis \
+            --x64 \
+            --publish never
+          installer="$(find apps/desktop/release-builder -maxdepth 1 -type f -name 'SOrange-*-win-x64.exe' -print -quit)"
+          [[ -n "$installer" && -s "$installer" ]] || { echo 'Baseline Windows installer was not created' >&2; exit 1; }
+          node apps/desktop/scripts/verify-windows-package.mjs --app-dir "$portable_app" --version "$SORANGE_DESKTOP_VERSION"
+
+      - name: Preserve baseline installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: sorange-${{ inputs.baseline_version }}-upgrade-baseline
+          path: source/apps/desktop/release-builder/SOrange-*-win-x64.exe
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+  validate-upgrade:
+    name: Upgrade ${{ inputs.baseline_version }} to production ${{ inputs.target_version }}
+    needs: build-baseline
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out validation harness
+        uses: actions/checkout@v5
+        with:
+          repository: Burns1028/sorange
+          ref: ${{ inputs.validation_source_revision }}
+          token: ${{ secrets.SOURCE_REPOSITORY_TOKEN }}
+          path: source
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Download baseline installer
+        uses: actions/download-artifact@v5
+        with:
+          name: sorange-${{ inputs.baseline_version }}-upgrade-baseline
+          path: baseline
+
+      - name: Download and verify production installer
+        id: target-installer
+        shell: pwsh
+        env:
+          TARGET_INSTALLER_URL: ${{ inputs.target_installer_url }}
+          TARGET_SHA256: ${{ inputs.target_sha256 }}
+          TARGET_VERSION: ${{ inputs.target_version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $targetPath = Join-Path $env:RUNNER_TEMP "SOrange-$env:TARGET_VERSION-win-x64.exe"
+          Invoke-WebRequest -Uri $env:TARGET_INSTALLER_URL -OutFile $targetPath
+          $actualHash = (Get-FileHash -LiteralPath $targetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:TARGET_SHA256.ToLowerInvariant()) {
+            throw "Production installer SHA256 mismatch: expected $env:TARGET_SHA256, found $actualHash"
+          }
+          "path=$targetPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Verified production installer $targetPath ($actualHash)"
+
+      - name: Run true cross-version upgrade coverage
+        shell: pwsh
+        env:
+          BASELINE_VERSION: ${{ inputs.baseline_version }}
+          TARGET_VERSION: ${{ inputs.target_version }}
+          TARGET_INSTALLER_PATH: ${{ steps.target-installer.outputs.path }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $baseline = Get-ChildItem 'baseline/SOrange-*-win-x64.exe' | Select-Object -First 1
+          if (-not $baseline -or $baseline.Length -le 0) { throw 'Baseline installer was not downloaded' }
+          & 'source/apps/desktop/scripts/test-windows-installer.ps1' `
+            -InstallerPath $env:TARGET_INSTALLER_PATH `
+            -Version $env:TARGET_VERSION `
+            -PreviousInstallerPath $baseline.FullName `
+            -PreviousVersion $env:BASELINE_VERSION `
+            -RequireCrossVersion `
+            -Cycles 2
+
+      - name: Preserve upgrade screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sorange-${{ inputs.baseline_version }}-to-${{ inputs.target_version }}-production-smoke
+          path: ${{ runner.temp }}/sorange-smoke-*.png
+          if-no-files-found: warn
+          retention-days: 3
