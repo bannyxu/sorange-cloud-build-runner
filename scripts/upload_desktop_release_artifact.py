@@ -93,12 +93,19 @@ def artifact_upload_url() -> str:
     return callback_url.rstrip("/") + "/build-artifact"
 
 
-def post_artifact(path: Path, target: str, status: str) -> None:
-    try:
-        import requests  # type: ignore
-    except Exception as exc:
-        raise RuntimeError(f"Python package 'requests' is required: {exc}") from exc
-
+def artifact_upload_data(target: str, status: str) -> dict[str, str]:
+    if status != "uploaded":
+        raise RuntimeError("Artifact upload status must be uploaded")
+    build_run_id = required("BUILD_RUN_ID")
+    github_run_id = env("GITHUB_RUN_ID")
+    if github_run_id and build_run_id != f"github:{github_run_id}":
+        raise RuntimeError("BUILD_RUN_ID does not match the current GitHub run")
+    verification_status = required("RELEASE_ARTIFACT_VERIFICATION_STATUS")
+    if verification_status != "verified":
+        raise RuntimeError("Artifact upload requires a completed verification gate")
+    verification_run_id = required("RELEASE_ARTIFACT_VERIFICATION_RUN_ID")
+    if verification_run_id != build_run_id:
+        raise RuntimeError("Artifact verification run does not match the build run")
     data = {
         "token": required("RELEASE_CALLBACK_TOKEN"),
         "releaseId": required("RELEASE_ID"),
@@ -106,15 +113,30 @@ def post_artifact(path: Path, target: str, status: str) -> None:
         "releaseChannel": required("RELEASE_CHANNEL"),
         "target": target,
         "status": status,
-        "buildRunId": env("BUILD_RUN_ID") or env("GITHUB_RUN_ID"),
+        "buildRunId": build_run_id,
+        "verificationStatus": verification_status,
+        "verificationRunId": verification_run_id,
     }
-    optional_verification_fields = {
-        "verificationStatus": env("RELEASE_ARTIFACT_VERIFICATION_STATUS"),
+    optional_fields = {
         "signatureStatus": env("RELEASE_ARTIFACT_SIGNATURE_STATUS"),
         "smokeStatus": env("RELEASE_ARTIFACT_SMOKE_STATUS"),
-        "verificationRunId": env("GITHUB_RUN_ID") or env("BUILD_RUN_ID"),
     }
-    data.update({key: value for key, value in optional_verification_fields.items() if value})
+    if target == "win-x64" and (
+        optional_fields["signatureStatus"] not in {"valid", "unsigned"}
+        or optional_fields["smokeStatus"] != "passed"
+    ):
+        raise RuntimeError("Windows artifact upload requires signature and installation smoke results")
+    data.update({key: value for key, value in optional_fields.items() if value})
+    return data
+
+
+def post_artifact(path: Path, target: str, status: str) -> None:
+    try:
+        import requests  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(f"Python package 'requests' is required: {exc}") from exc
+
+    data = artifact_upload_data(target, status)
     for attempt in range(1, 4):
         try:
             with path.open("rb") as handle:

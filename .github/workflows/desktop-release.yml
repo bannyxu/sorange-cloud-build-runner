@@ -109,10 +109,10 @@ jobs:
               matrix='{"include":[{"target":"mac-x64","os":"macos-15-intel","kind":"mac","arch":"x64","puppeteer_platform":"mac","artifact_glob":"apps/desktop/release/SOrange-*-mac-x64.dmg"}]}'
               ;;
             win-x64)
-              matrix='{"include":[{"target":"win-x64","os":"macos-15-intel","kind":"windows-package","arch":"x64","artifact_glob":"apps/desktop/release-builder/SOrange-*-win-x64.exe"}]}'
+              matrix='{"include":[{"target":"win-x64","os":"windows-latest","kind":"windows-package","arch":"x64","artifact_glob":"apps/desktop/release-builder/SOrange-*-win-x64.exe"}]}'
               ;;
             all|"")
-              matrix='{"include":[{"target":"mac-arm64","os":"macos-26","kind":"mac","arch":"arm64","puppeteer_platform":"mac_arm","artifact_glob":"apps/desktop/release/SOrange-*-mac-arm64.dmg"},{"target":"mac-x64","os":"macos-15-intel","kind":"mac","arch":"x64","puppeteer_platform":"mac","artifact_glob":"apps/desktop/release/SOrange-*-mac-x64.dmg"},{"target":"win-x64","os":"macos-15-intel","kind":"windows-package","arch":"x64","artifact_glob":"apps/desktop/release-builder/SOrange-*-win-x64.exe"}]}'
+              matrix='{"include":[{"target":"mac-arm64","os":"macos-26","kind":"mac","arch":"arm64","puppeteer_platform":"mac_arm","artifact_glob":"apps/desktop/release/SOrange-*-mac-arm64.dmg"},{"target":"mac-x64","os":"macos-15-intel","kind":"mac","arch":"x64","puppeteer_platform":"mac","artifact_glob":"apps/desktop/release/SOrange-*-mac-x64.dmg"},{"target":"win-x64","os":"windows-latest","kind":"windows-package","arch":"x64","artifact_glob":"apps/desktop/release-builder/SOrange-*-win-x64.exe"}]}'
               ;;
             *)
               echo "Unsupported target filter: $TARGET_FILTER" >&2
@@ -181,6 +181,16 @@ jobs:
         working-directory: source
         run: node scripts/set-desktop-release-version.mjs "${{ inputs.version }}"
 
+      - name: Build pinned Windows DeepSeek Harness artifact
+        if: matrix.kind == 'windows-package'
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          dsh_artifact="$RUNNER_TEMP/sorange-dsh-artifact-win-x64"
+          node scripts/prepare-deepseek-harness-release-artifact.mjs --output "$dsh_artifact"
+          echo "SORANGE_DSH_ARTIFACT_DIR=$dsh_artifact" >> "$GITHUB_ENV"
+
       - name: Warm browser cache
         if: matrix.kind == 'mac'
         working-directory: source
@@ -198,6 +208,42 @@ jobs:
         working-directory: source
         run: node apps/desktop/scripts/local-github-macos-fallback.mjs --package 2>&1 | tee "$RUNNER_TEMP/sorange-package.log"
 
+      - name: Verify mounted macOS package channel and architecture
+        if: matrix.kind == 'mac'
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          dmg="$PWD/apps/desktop/release/SOrange-${SORANGE_DESKTOP_VERSION}-mac-${SORANGE_DESKTOP_TARGET_ARCH}.dmg"
+          mount_dir="$(mktemp -d "$RUNNER_TEMP/sorange-release-dmg.XXXXXX")"
+          trap 'hdiutil detach "$mount_dir" >/dev/null 2>&1 || true; rmdir "$mount_dir" 2>/dev/null || true' EXIT
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_dir" "$dmg"
+          node - "$mount_dir" "$RELEASE_VERSION" "$RELEASE_CHANNEL" "$SORANGE_DESKTOP_TARGET_ARCH" <<'NODE'
+          const {execFileSync} = require('node:child_process');
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const [mountDir, expectedVersion, expectedChannel, targetArch] = process.argv.slice(2);
+          const apps = fs.readdirSync(mountDir, {withFileTypes: true})
+            .filter((entry) => entry.isDirectory() && entry.name.endsWith('.app'));
+          if (apps.length !== 1) throw new Error(`Expected one mounted SOrange app, found ${apps.length}`);
+          const manifest = JSON.parse(fs.readFileSync(path.join(
+            mountDir, apps[0].name, 'Contents', 'Resources', 'app', 'package.json',
+          ), 'utf8'));
+          if (manifest.version !== expectedVersion || manifest.sorangeReleaseChannel !== expectedChannel) {
+            throw new Error(`macOS package identity mismatch: expected ${expectedVersion}/${expectedChannel}, found ${manifest.version}/${manifest.sorangeReleaseChannel}`);
+          }
+          const expectedCpuArch = {x64: 'x86_64', arm64: 'arm64'}[targetArch];
+          if (!expectedCpuArch) throw new Error(`Unsupported macOS target architecture: ${targetArch}`);
+          const executable = path.join(mountDir, apps[0].name, 'Contents', 'MacOS', 'SOrange');
+          const actualCpuArch = execFileSync('lipo', ['-archs', executable], {encoding: 'utf8'}).trim();
+          if (actualCpuArch !== expectedCpuArch) {
+            throw new Error(`macOS package architecture mismatch: expected ${expectedCpuArch}, found ${actualCpuArch}`);
+          }
+          console.log(`Verified mounted macOS package ${manifest.version}/${manifest.sorangeReleaseChannel}/${actualCpuArch}`);
+          NODE
+          echo "RELEASE_ARTIFACT_VERIFICATION_STATUS=verified" >> "$GITHUB_ENV"
+          echo "RELEASE_ARTIFACT_VERIFICATION_RUN_ID=$BUILD_RUN_ID" >> "$GITHUB_ENV"
+
       - name: Build and verify Windows installer
         if: matrix.kind == 'windows-package'
         shell: bash
@@ -214,7 +260,7 @@ jobs:
             exit 1
           fi
           if [[ -n "${WINDOWS_CODE_SIGNING_PFX_BASE64:-}" ]]; then
-            python3 - "$certificate_path" <<'PY'
+            python - "$certificate_path" <<'PY'
           import base64
           import os
           import pathlib
@@ -229,20 +275,26 @@ jobs:
             unset WIN_CSC_LINK WIN_CSC_KEY_PASSWORD || true
           fi
 
-          pnpm --filter @sorange-v2/desktop build
+          pnpm --filter @sorange/desktop build
           export SORANGE_WINDOWS_SKIP_ZIP=1
           node apps/desktop/scripts/package-windows.mjs
           portable_app="$PWD/apps/desktop/release/SOrange-win32-x64"
-          pnpm --filter @sorange-v2/desktop exec electron-builder \
+          builder_overrides=()
+          if [[ "$RELEASE_CHANNEL" == beta ]]; then
+            numeric_build_version="$(node --input-type=module -e 'import {windowsNumericBuildVersion} from "./apps/desktop/scripts/release-version.mjs"; console.log(windowsNumericBuildVersion(process.env.SORANGE_DESKTOP_VERSION));')"
+            builder_overrides+=("--config.buildVersion=$numeric_build_version")
+          fi
+          pnpm --filter @sorange/desktop exec electron-builder \
             --projectDir . \
             --config electron-builder.yml \
+            "${builder_overrides[@]}" \
             --prepackaged "$portable_app" \
             --win nsis \
             --x64 \
             --publish never
           installer="$(find apps/desktop/release-builder -maxdepth 1 -type f -name 'SOrange-*-win-x64.exe' -print -quit)"
           [[ -n "$installer" && -s "$installer" ]] || { echo 'Windows installer was not created' >&2; exit 1; }
-          node apps/desktop/scripts/verify-windows-package.mjs --app-dir "$portable_app" --version "$SORANGE_DESKTOP_VERSION"
+          node apps/desktop/scripts/verify-windows-package.mjs --app-dir "$portable_app" --version "$SORANGE_DESKTOP_VERSION" --release-channel "$RELEASE_CHANNEL"
           rm -f "$certificate_path"
 
       - name: Preserve packaged artifact
@@ -328,6 +380,7 @@ jobs:
           $arguments = @{
             InstallerPath = $installer.FullName
             Version = $env:SORANGE_DESKTOP_VERSION
+            ReleaseChannel = $env:RELEASE_CHANNEL
             Cycles = 2
           }
           if ($hasSigningCertificate) { $arguments.RequireSignature = $true }
@@ -335,6 +388,7 @@ jobs:
           $signatureStatus = if ($hasSigningCertificate) { 'valid' } else { 'unsigned' }
           @(
             'RELEASE_ARTIFACT_VERIFICATION_STATUS=verified'
+            "RELEASE_ARTIFACT_VERIFICATION_RUN_ID=$env:BUILD_RUN_ID"
             "RELEASE_ARTIFACT_SIGNATURE_STATUS=$signatureStatus"
             'RELEASE_ARTIFACT_SMOKE_STATUS=passed'
           ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
