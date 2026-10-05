@@ -9,14 +9,13 @@ name: SOrange Windows Installer E2E
       version:
         description: Test package version
         required: true
-        default: 2.0.17-test.1
+        default: 2.0.40
       cycles:
         description: Install/upgrade/uninstall cycles per Windows runner
         required: true
         type: choice
         default: "2"
         options:
-          - "1"
           - "2"
           - "3"
       previous_installer_url:
@@ -34,8 +33,10 @@ concurrency:
 jobs:
   build:
     name: Build unsigned validation installer
-    runs-on: macos-15-intel
+    runs-on: windows-latest
     timeout-minutes: 180
+    outputs:
+      source_sha: ${{ steps.lock-source.outputs.sha }}
     env:
       SORANGE_DESKTOP_VERSION: ${{ inputs.version }}
       SORANGE_DESKTOP_TARGET_ARCH: x64
@@ -50,9 +51,15 @@ jobs:
           path: source
           fetch-depth: 1
 
+      - name: Lock exact app source
+        id: lock-source
+        shell: bash
+        working-directory: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - uses: pnpm/action-setup@v4
         with:
-          version: 11.8.0
+          version: 10.27.0
 
       - uses: actions/setup-node@v5
         with:
@@ -68,22 +75,43 @@ jobs:
         working-directory: source
         run: node scripts/set-desktop-release-version.mjs "${{ inputs.version }}"
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build pinned Windows runtime from locked source
+        shell: bash
+        working-directory: source
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          dsh_artifact="$RUNNER_TEMP/sorange-dsh-artifact-win-x64"
+          node scripts/prepare-deepseek-harness-release-artifact.mjs --output "$dsh_artifact"
+          echo "SORANGE_DSH_ARTIFACT_DIR=$dsh_artifact" >> "$GITHUB_ENV"
+
+      - name: Verify Windows private filesystem regression
+        working-directory: source
+        run: pnpm --filter @sorange/dsh-skill-evolution exec tsx --test src/private-filesystem.test.ts
+
       - name: Build unsigned installer for functional validation only
         working-directory: source
         shell: bash
         run: |
           set -euo pipefail
-          pnpm --filter @sorange-v2/desktop build
+          pnpm --filter @sorange/desktop build
           export SORANGE_WINDOWS_SKIP_ZIP=1
           node apps/desktop/scripts/package-windows.mjs
           portable_app="$PWD/apps/desktop/release/SOrange-win32-x64"
-          pnpm --filter @sorange-v2/desktop exec electron-builder \
+          pnpm --filter @sorange/desktop exec electron-builder \
             --projectDir . \
             --config electron-builder.yml \
             --prepackaged "$portable_app" \
             --win nsis \
             --x64 \
             --publish never
+          node apps/desktop/scripts/verify-windows-package.mjs --app-dir "$portable_app" --version "$SORANGE_DESKTOP_VERSION"
 
       - name: Upload validation installer
         uses: actions/upload-artifact@v4
@@ -110,7 +138,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: Burns1028/sorange
-          ref: ${{ inputs.source_revision }}
+          ref: ${{ needs.build.outputs.source_sha }}
           token: ${{ secrets.SOURCE_REPOSITORY_TOKEN }}
           path: source
           fetch-depth: 1
